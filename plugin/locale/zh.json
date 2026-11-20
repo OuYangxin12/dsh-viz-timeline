@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "camodel 泳道图桥接",
+    "description": "会话可以通过本地桥查询并操控 camodel-viz 泳道图：统计、cycle 查询、视图控制、高亮标记与运行时换数据。"
+  }
+}
