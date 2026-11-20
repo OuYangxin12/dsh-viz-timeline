@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  :root{ --bar:#1a9850; --bar-d:#0d6b38; --ink:#222; --sub:#666; --line:#ddd; --zebra:rgba(0,0,0,.035); }
+  *{box-sizing:border-box}
+  body{font:13px/1.45 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;color:var(--ink);margin:0;padding:14px 18px 40px;background:#fafafa}
+  h1{font-size:17px;margin:2px 0 4px}
+  .desc{color:var(--sub);margin:0 0 10px;max-width:1100px}
+  .controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin:10px 0;position:sticky;top:0;z-index:30}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--sub);font-size:12px;align-items:center}
+  .legend i{display:inline-block;width:14px;height:10px;border-radius:2px;vertical-align:-1px;margin-right:4px}
+  table.sum{border-collapse:collapse;margin:8px 0 14px;background:#fff;font-size:12px}
+  table.sum th,table.sum td{border:1px solid var(--line);padding:3px 9px;text-align:right;font-variant-numeric:tabular-nums}
+  table.sum th{background:#f0f3f7}
+  table.sum td.l,table.sum th.l{text-align:left}
+  section.panel{background:#fff;border:1px solid var(--line);border-radius:8px;margin:0 0 16px;padding:10px 12px 8px}
+  .phead{display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;margin-bottom:6px}
+  .phead .t{font-weight:600;font-size:13.5px}
+  .phead .s{color:var(--sub);font-size:12px;font-variant-numeric:tabular-nums}
+  .body{display:flex}
+  .gutter{width:64px;flex:none;position:relative;color:var(--sub);font-size:10px}
+  .gutter div{position:absolute;padding-left:6px}
+  .scroller{flex:1;overflow-x:auto;overflow-y:hidden;border:1px solid #e3e3e3;border-radius:4px;background:#fff;cursor:crosshair}
+  svg.world{display:block}
+  svg.axis{display:block;margin:2px 0 0 64px;background:#fff}
+  .minimap{margin:4px 0 0 64px;height:30px;border:1px solid #e3e3e3;border-radius:4px;background:#fcfcfc;cursor:pointer;position:relative}
+  .tip{position:fixed;z-index:99;background:rgba(30,30,30,.93);color:#fff;font-size:12px;padding:7px 10px;border-radius:6px;pointer-events:none;white-space:pre;line-height:1.5;display:none;max-width:380px}
+  .tip .pin{color:#ffd27f}
+  .hint{color:#999;font-size:11px;margin:2px 0 0 64px}
+  .caveat{color:var(--sub);font-size:12px;margin-top:14px;border-top:1px solid var(--line);padding-top:8px}
+</style>
+</head>
+<body>
+<h1>__H1__</h1>
+<p class="desc">驱动级日志（TASK_BEGIN/DONE、block_start / early_end / block_end）。绿条 = block 执行区间，深绿段 = drain，竖线 = task 边界。交互：滚轮以光标为锚缩放、底部滚动条/小地图平移、悬停看数值、点击固定。</p>
+<p class="desc" id="note">__NOTE__</p>
+
+<div class="controls">
+  <span class="legend">
+    <span><i style="background:var(--bar)"></i>block 执行 [block_start, block_end]</span>
+    <span><i style="background:var(--bar-d)"></i>drain [early_end, block_end]</span>
+    <span><i style="background:#1b9e77"></i>TASK_BEGIN</span>
+    <span><i style="background:#d73027"></i>TASK_DONE</span>
+    <span><i style="background:#e08214"></i>TASK_BEGIN（其它 stream）</span>
+  </span>
+</div>
+
+<div id="summary"></div>
+<div id="panel"></div>
+<div class="caveat">口径：仿真 cycle。本视图为驱动级事件（无指令级 Push/RETIRE），与 issue-queue dump 的泳道图是两种粒度，不可直接互比。日志若在某个 task BEGIN 处截断，后续 block 事件不在文件内。</div>
+<div class="tip" id="tip"></div>
+
+<script>
+"use strict";
+const DATA = __SEGS__;
+
+const PAD=10, PITCH=22, BARH=14, AXIS_H=22;
+const STEP=[20,50,100,200,500,1000,2000];
+const SMIN=0.02, SMAX=6;
+let S=0.1;
+const tip=document.getElementById('tip'); let pinned=false;
+
+function median(a){const b=[...a].sort((x,y)=>x-y);const m=b.length>>1;return b.length%2?b[m]:(b[m-1]+b[m])/2;}
+const cores=[...new Set(DATA.blocks.map(b=>b.core))].sort((a,b)=>a-b);
+const C0=Math.min(...DATA.blocks.map(b=>b.start),...DATA.tasks.map(t=>t.cycle))-20;
+const C1=Math.max(...DATA.blocks.map(b=>b.end),...DATA.tasks.map(t=>t.cycle))+40;
+const laneOf={}; cores.forEach((c,i)=>laneOf[c]=i);
+const WH=cores.length*PITCH+8;
+const durs=DATA.blocks.map(b=>b.end-b.start), drains=DATA.blocks.map(b=>b.end-b.early);
+const task0=DATA.tasks.find(t=>t.kind==='TASK_BEGIN'&&t.stream===0), task0done=DATA.tasks.find(t=>t.kind==='TASK_DONE'&&t.stream===0);
+
+(function(){
+  const row='<tr><td class=l>'+DATA.blocks.length+'</td><td>'+cores.length+'</td><td>'+(task0done.cycle-task0.cycle)+'</td><td>'+Math.min(...durs)+' / '+Math.round(median(durs))+' / '+Math.max(...durs)+'</td><td>'+Math.min(...drains)+' / '+Math.round(median(drains))+' / '+Math.max(...drains)+'</td><td class=l>'+DATA.blocks.length+' blocks / '+cores.length+' cores</td></tr>';
+  document.getElementById('summary').innerHTML='<table class=sum><tr><th class=l>blocks</th><th>cores</th><th>task0 wall(cyc)</th><th>dur min/med/max</th><th>drain min/med/max</th><th class=l>备注</th></tr>'+row+'</table>';
+})();
+
+const panelBox=document.getElementById('panel');
+const sec=document.createElement('section'); sec.className='panel';
+sec.innerHTML='<div class=phead><span class=t>block 调度 · span '+C0+'..'+C1+'</span><span class=s>'+DATA.blocks.length+' block · core '+cores[0]+'..'+cores[cores.length-1+'']+'</span></div>'+
+'<div class=body><div class=gutter>'+cores.map((c,i)=>'<div style="top:'+(i*PITCH+8)+'px">core '+c+'</div>').join('')+'</div>'+
+'<div class=scroller><svg class=world xmlns="http://www.w3.org/2000/svg"></svg></div></div>'+
+'<svg class=axis xmlns="http://www.w3.org/2000/svg"></svg>'+
+'<div class=minimap><svg width="100%" height="30" xmlns="http://www.w3.org/2000/svg"></svg></div>'+
+'<div class=hint>小地图：点击/拖动定位视口 · 滚轮以光标为锚缩放、底部滚动条平移 · 悬停看数值</div>';
+panelBox.appendChild(sec);
+const scroller=sec.querySelector('.scroller'), world=sec.querySelector('svg.world'), axis=sec.querySelector('svg.axis'), mini=sec.querySelector('.minimap svg');
+
+function xw(c){return (c-C0)*S+PAD;}
+function renderWorld(){
+  const W=(C1-C0)*S+PAD*2;
+  world.setAttribute('width',W); world.setAttribute('height',WH);
+  const h=[];
+  for(let i=0;i<cores.length;i++){ if(i%2===0) h.push('<rect x="0" y="'+(i*PITCH+2)+'" width="'+W+'" height="'+PITCH+'" fill="var(--zebra)"/>'); }
+  for(const st of STEP){ if(st*S>=70){ let t=Math.ceil(C0/st)*st;
+    for(;t<=C1;t+=st){ const x=xw(t); h.push('<line x1="'+x+'" y1="0" x2="'+x+'" y2="'+WH+'" stroke="#eee"/>'); }
+    break; } }
+  for(const t of DATA.tasks){
+    const x=xw(t.cycle);
+    const col=t.kind==='TASK_BEGIN'?(t.stream===0?'#1b9e77':'#e08214'):'#d73027';
+    const dash=t.stream===1?' stroke-dasharray="4 3"':'';
+    h.push('<line x1="'+x+'" y1="0" x2="'+x+'" y2="'+WH+'" stroke="'+col+'" stroke-width="1.6"'+dash+' data-tip="'+t.kind+' (stream '+t.stream+') @ '+t.cycle+'"/>');
+  }
+  for(const b of DATA.blocks){
+    const y=laneOf[b.core]*PITCH+6, x1=xw(b.start), x2=xw(b.early), x3=xw(b.end);
+    const wMain=Math.max(1.5,x3-x1), wDrain=Math.max(0,x3-x2);
+    h.push('<rect x="'+x1+'" y="'+y+'" width="'+wMain+'" height="'+BARH+'" rx="2" fill="var(--bar)" stroke="var(--bar-d)" stroke-width=".7" data-tip="block '+b.bid+' @ core '+b.core+'&#10;block_start '+b.start+' → early_end '+b.early+'（'+(b.early-b.start)+'c）&#10;drain '+(b.end-b.early)+'c → block_end '+b.end+'&#10;total '+(b.end-b.start)+'c"/>');
+    if(wDrain>0) h.push('<rect x="'+x2+'" y="'+y+'" width="'+wDrain+'" height="'+BARH+'" rx="2" fill="var(--bar-d)" opacity=".85" data-tip="block '+b.bid+' drain 段 ['+b.early+', '+b.end+']"/>');
+    if(wMain>=34) h.push('<text x="'+(x1+3)+'" y="'+(y+11)+'" font-size="9" fill="#fff">b'+b.bid+'</text>');
+  }
+  h.push('<rect class=cross x="-20" y="0" width="1" height="'+WH+'" fill="#888" opacity=".6"/>');
+  world.innerHTML=h.join('');
+}
+function renderAxis(){
+  const vw=scroller.clientWidth, sl=scroller.scrollLeft;
+  axis.setAttribute('width',vw); axis.setAttribute('height',AXIS_H);
+  let st=STEP[STEP.length-1]; for(const s of STEP){ if(s*S>=80){st=s;break;} }
+  const h=['<line x1="0" y1="1" x2="'+vw+'" y2="1" stroke="#bbb"/>'];
+  let t=Math.ceil((C0+(sl-PAD)/S)/st)*st;
+  for(;t<=C0+(sl+vw)/S && t<=C1;t+=st){
+    const x=(t-C0)*S+PAD-sl;
+    h.push('<line x1="'+x+'" y1="1" x2="'+x+'" y2="7" stroke="#999"/>');
+    h.push('<text x="'+(x+3)+'" y="16" font-size="10" fill="#666">'+t+'</text>');
+  }
+  h.push('<text x="'+(vw-4)+'" y="16" font-size="10" fill="#aaa" text-anchor="end">cycle</text>');
+  axis.innerHTML=h.join('');
+}
+function renderMini(){
+  const vw=scroller.clientWidth, W=mini.clientWidth||vw, span=C1-C0;
+  const X=c=>(c-C0)/span*W, YW=W/span;
+  const h=[];
+  for(const b of DATA.blocks){ h.push('<rect x="'+X(b.start)+'" y="'+(4+Math.floor(laneOf[b.core]/36*24))+'" width="'+Math.max(.5,(b.end-b.start)*YW)+'" height="4" fill="var(--bar)" opacity=".6"/>'); }
+  for(const t of DATA.tasks){ h.push('<line x1="'+X(t.cycle)+'" y1="2" x2="'+X(t.cycle)+'" y2="28" stroke="'+(t.kind==='TASK_BEGIN'?(t.stream===0?'#1b9e77':'#e08214'):'#d73027')+'" stroke-width="1"/>'); }
+  const vx=Math.max(0,((scroller.scrollLeft-PAD)/S)/span*W), vwc=Math.min(W,vw/S/span*W);
+  h.push('<rect x="'+vx+'" y="1" width="'+vwc+'" height="28" fill="rgba(70,130,180,.18)" stroke="#4682b4"/>');
+  mini.innerHTML=h.join('');
+}
+function view(){return Math.max(1,scroller.scrollWidth-scroller.clientWidth);}
+function applyScale(ns, anchorCyc, offX){
+  S=Math.min(SMAX,Math.max(SMIN,ns));
+  renderWorld();
+  if(anchorCyc!=null){ scroller.scrollLeft=Math.max(0,Math.min((anchorCyc-C0)*S+PAD-offX, view())); }
+  renderAxis(); renderMini();
+}
+renderWorld(); renderAxis(); renderMini();
+scroller.addEventListener('scroll',()=>{ renderAxis(); renderMini(); });
+scroller.addEventListener('wheel',e=>{ e.preventDefault();
+  const off=e.clientX-scroller.getBoundingClientRect().left;
+  const cyc=C0+(scroller.scrollLeft+off-PAD)/S;
+  const ns=S*Math.exp(-e.deltaY*0.0016);
+  if(Math.abs(ns-S)/S<0.01) return;
+  applyScale(ns,cyc,off);
+},{passive:false});
+world.addEventListener('mousemove',e=>{
+  const r=world.getBoundingClientRect();
+  const c=world.querySelector('.cross'); if(c) c.setAttribute('x',e.clientX-r.left-0.5);
+});
+const mm=sec.querySelector('.minimap'); let drag=false;
+const jump=e=>{ const rect=mm.getBoundingClientRect();
+  const frac=Math.min(1,Math.max(0,(e.clientX-rect.left)/rect.width));
+  scroller.scrollLeft=(C0+frac*(C1-C0)-C0)*S+PAD-scroller.clientWidth/2; };
+mm.addEventListener('mousedown',e=>{drag=true;jump(e);e.preventDefault();});
+window.addEventListener('mousemove',e=>{if(drag)jump(e);});
+window.addEventListener('mouseup',()=>drag=false);
+function showTip(txt,x,y){
+  tip.innerHTML=txt+(pinned?'<span class="pin">　◈ 已固定，点空白取消</span>':'');
+  tip.style.display='block';
+  const r=tip.getBoundingClientRect();
+  tip.style.left=Math.min(window.innerWidth-r.width-8,x+14)+'px';
+  tip.style.top=Math.min(window.innerHeight-r.height-8,y+14)+'px';
+}
+document.addEventListener('mouseover',e=>{ const t=e.target.closest('[data-tip]');
+  if(t&&!pinned) showTip(t.getAttribute('data-tip'),e.clientX,e.clientY);
+  else if(!t&&!pinned) tip.style.display='none'; });
+document.addEventListener('mousemove',e=>{ const t=e.target.closest('[data-tip]');
+  if(t&&!pinned) showTip(t.getAttribute('data-tip'),e.clientX,e.clientY); });
+document.addEventListener('click',e=>{ const t=e.target.closest('[data-tip]');
+  if(t){ pinned=true; showTip(t.getAttribute('data-tip'),e.clientX,e.clientY); }
+  else { pinned=false; tip.style.display='none'; } });
+window.addEventListener('resize',()=>{ renderAxis(); renderMini(); });
+applyScale(scroller.clientWidth/((C1-C0)*1.02), null, 0);
+</script>
+</body>
+</html>
