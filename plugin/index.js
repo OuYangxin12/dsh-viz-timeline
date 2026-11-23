@@ -17,8 +17,11 @@
  * authoring DSL into the raw JSON Schema the Host tool registry expects.
  */
 import { createServer } from 'node:http'
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { basename, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { ingest } from './ingest.js'
 
 export const name = 'dsh-viz-timeline'
 export const inject = ['tools']
@@ -27,6 +30,9 @@ const DEFAULT_PORT = 47131
 const PORT_ATTEMPTS = 20
 const LONG_POLL_MS = 25_000
 const PAGE_STALE_MS = 45_000
+const PAGE_PATH = '/viz-timeline'
+const BRIDGE_PATH = '/viz-timeline/bridge'
+
 
 /* ------------------------------------------------------------------ *
  * Bridge（协议与 scripts/bridge_server.py 完全一致）
@@ -91,7 +97,7 @@ class Bridge {
   /** Agent/工具侧：下发命令并等待页面结果。 */
   requestOp(body, timeoutMs = 20_000) {
     if (!this.hasPage()) {
-      return Promise.reject(new Error('没有可视化页面连接到桥。请用 ?bridge=' + this.port + ' 打开 timeline.html 并刷新。'))
+      return Promise.reject(new Error(`没有页面连接到桥。打开托管页面 ${PAGE_PATH} 后重试（页面自己连桥）。`))
     }
     const id = this.push('cmd', body)
     return new Promise((resolve, reject) => {
@@ -120,6 +126,14 @@ class Bridge {
     return Date.now() - this.pageSeenAt <= PAGE_STALE_MS
   }
 
+  /** 经 webServer 的同源路由进来时，把前缀剥掉再走原协议。 */
+  async handleRoute(req, res, prefix) {
+    if (typeof req.url === 'string' && req.url.startsWith(prefix)) {
+      req.url = req.url.slice(prefix.length) || '/'
+    }
+    return this.handle(req, res)
+  }
+
   async handle(req, res) {
     res.setHeader('access-control-allow-origin', '*')
     res.setHeader('access-control-allow-headers', 'content-type,x-viz-token')
@@ -144,7 +158,9 @@ class Bridge {
 
     if (req.method === 'GET' && url.pathname === '/next') { // 页面长轮询取命令（取出即出队）
       this.pageSeenAt = Date.now()
-      const since = Number(url.searchParams.get('since') ?? 0) || 0
+      const rawSince = Number(url.searchParams.get('since') ?? 0) || 0
+      // 桥重启后 seq 会归零；页面还带着上一代更大的 since，必须归零否则永远收不到命令
+      const since = rawSince > this.seq ? 0 : rawSince
       const deadline = Date.now() + LONG_POLL_MS
       for (;;) {
         const idx = this.q.findIndex((r) => r.seq > since)
@@ -154,8 +170,8 @@ class Bridge {
         }
         if (Date.now() > deadline) return sendJson(res, 200, { since: this.seq })
         await new Promise((resolve) => {
-          const timer = setTimeout(done, 2000)
           const done = () => { clearTimeout(timer); this.waiters.delete(done); resolve() }
+          const timer = setTimeout(done, 2000)
           this.waiters.add(done)
         })
       }
@@ -181,6 +197,61 @@ class Bridge {
     }
 
     return sendJson(res, 404, { error: `unknown bridge route ${url.pathname}` })
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * 托管页面：插件自己出页面，页面用相对地址连桥，不再手拼 ?bridge=PORT
+ * ------------------------------------------------------------------ */
+
+class VizPage {
+  constructor() {
+    this.segs = null
+    this.meta = { title: 'camodel 泳道图', h1: null, note: '' }
+    this.template = null
+    this.updatedAt = 0
+    this.receipt = null
+  }
+
+  async templateText() {
+    if (this.template !== null) return this.template
+    for (const url of [
+      new URL('./templates/timeline.html', import.meta.url),
+      new URL('../templates/timeline.html', import.meta.url),
+    ]) {
+      try {
+        this.template = await readFile(url, 'utf8')
+        return this.template
+      } catch { /* 试下一个位置 */ }
+    }
+    throw new Error('找不到 timeline.html 模板：插件目录 templates/ 与仓库 templates/ 都没有。')
+  }
+
+  setData(segs, meta = {}, receipt = null) {
+    this.segs = segs
+    this.meta = { ...this.meta, ...meta }
+    this.receipt = receipt
+    this.updatedAt = Date.now()
+  }
+
+  async html() {
+    if (this.segs === null) {
+      return `<!doctype html><meta charset="utf-8"><title>camodel 泳道图</title>
+<style>body{font:14px/1.6 system-ui;margin:40px;color:#333}code{background:#f3f3f3;padding:1px 5px;border-radius:3px}</style>
+<p>还没有数据。让会话跑一次 <code>viz_ingest</code>，页面会自动刷新。</p>
+<script>setTimeout(()=>location.reload(),3000)</script>`
+    }
+    const tpl = await this.templateText()
+    const title = this.meta.title ?? 'camodel 泳道图'
+    const replaced = tpl.replace('const SEGS = __SEGS__;', () =>
+      `window.__VIZ_BRIDGE_BASE__=${JSON.stringify(BRIDGE_PATH)};\nconst SEGS = ${JSON.stringify(this.segs)};`)
+    let html = replaced
+      .replace(/__TITLE__/g, () => title)
+      .replace(/__H1__/g, () => this.meta.h1 ?? title)
+    html = this.meta.note
+      ? html.replace(/__NOTE__/g, () => this.meta.note)
+      : html.replace(/<p class="desc" id="note">__NOTE__<\/p>\n?/, '')
+    return html
   }
 }
 
@@ -259,7 +330,7 @@ function segParam() {
   return { type: 'integer', description: '面板段号（从 1 开始；缺省为第 1 段）' }
 }
 
-function vizTools(bridge) {
+function vizTools(bridge, page, urlOf) {
   const run = async (body, exec, timeoutMs) => {
     exec.signal.throwIfAborted()
     return jsonSafe(await bridge.requestOp(body, timeoutMs))
@@ -278,17 +349,19 @@ function vizTools(bridge) {
           page_connected: { type: 'boolean', required: true },
           queued: { type: 'number', required: true },
           token_required: { type: 'boolean', required: true },
+          page_url: { type: 'string' },
         },
       },
       render: textRender((v) => v.page_connected
-        ? `桥已连接页面（127.0.0.1:${v.port}，队列 ${v.queued}）。`
-        : `桥在 127.0.0.1:${v.port} 运行，但没有页面连接。请用 timeline.html?bridge=${v.port} 打开并刷新。`),
+        ? `桥已连接页面（127.0.0.1:${v.port}，队列 ${v.queued}）。页面：${v.page_url || '(未托管)'}`
+        : `桥在运行，但还没有页面连上。打开 ${v.page_url || '托管页面'} 即可（页面自己连桥，不用拼端口）。`),
     },
     execute: async (_args, exec) => {
       exec.signal.throwIfAborted()
       return {
         bridge: 'up', port: bridge.port, page_connected: bridge.hasPage(),
         queued: bridge.q.length, token_required: bridge.token !== null,
+        page_url: urlOf() ?? '',
       }
     },
   })
@@ -393,7 +466,103 @@ function vizTools(bridge) {
     timeoutMs: 30_000,
   })
 
-  return { status, stats, at, rounds, view, highlight, load }
+  const ingestTool = defineTool({
+    name: 'viz_ingest',
+    description: '接 case 目录出泳道图数据：读目录里的 issue-queue dump 与驱动日志，按 done+++ 分段识别事件，产出 segs.json 和对账回执（识别/未识别行数、md5 去重、跳过的 debug 回声、段界、截断告警、时间单位口径）。未知行型进回执不中断；日志截断时返回 blocked 不生成图。',
+    parameters: {
+      dirs: { type: 'array', items: { type: 'string' }, required: true, description: 'case 目录绝对路径，可传多个（多目录 = 多面板 A/B 对照）' },
+      title: { type: 'string', description: '页面标题' },
+      note: { type: 'string', description: '页面说明段落（口径、样例来源等）' },
+      out: { type: 'string', description: 'segs.json 与 receipt.json 的输出目录（缺省为系统临时目录）' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: true,
+        properties: {
+          status: { type: 'string', required: true },
+          segs: { type: 'number' },
+          segs_path: { type: 'string' },
+          receipt_path: { type: 'string' },
+          page_url: { type: 'string' },
+        },
+      },
+      render: textRender((v) => {
+        if (v.status !== 'ok') return `没出图：${v.reason ?? '未知原因'}`
+        const l = v.receipt?.lines ?? {}
+        const segs = (v.receipt?.segments ?? []).map((s) => `seg${s.i} ${s.kind} T=${s.T} load ${s.counts.load}/store ${s.counts.store}/alloc ${s.counts.alloc}/free ${s.counts.free}/bar ${s.counts.bar}`).join('\n')
+        return `已出 ${v.segs} 段。识别 ${l.events_recognized ?? '?'} 行事件，未识别 ${l.unrecognized ?? '?'} 行，跳过 debug 回声 ${l.skipped_debug_echo ?? '?'} 行。\n${segs}\n页面：${v.page_url ?? '(未托管)'}\nsegs: ${v.segs_path}\n回执: ${v.receipt_path}`
+      }),
+    },
+    execute: async (args, exec) => {
+      exec.signal.throwIfAborted()
+      const dirs = (args.dirs ?? []).map(String)
+      if (dirs.length === 0) throw new Error('dirs 不能为空')
+      const result = await ingest({ dirs })
+      const outDir = args.out === undefined
+        ? join(process.env.DSH_HOME ?? homedir(), 'viz-timeline', String(Date.now()))
+        : String(args.out)
+      await mkdir(outDir, { recursive: true })
+      const receiptPath = join(outDir, 'receipt.json')
+      await writeFile(receiptPath, JSON.stringify(result.receipt ?? {}, null, 2))
+      if (result.status !== 'ok' || !Array.isArray(result.segs)) {
+        return {
+          status: result.status ?? 'blocked',
+          reason: result.reason ?? result.detail ?? '没有可出图的数据',
+          detail: result.detail ?? null,
+          receipt: result.receipt ?? null,
+          segs: 0, segs_path: '', receipt_path: receiptPath, page_url: '',
+        }
+      }
+      const segsPath = join(outDir, 'segs.json')
+      await writeFile(segsPath, JSON.stringify(result.segs))
+      const title = args.title ?? `camodel 泳道图（${dirs.map((d) => basename(d)).join(' / ')}）`
+      page.setData(result.segs, { title, h1: title, note: args.note ?? '' }, result.receipt)
+      return {
+        status: 'ok',
+        segs: result.segs.length,
+        segs_path: segsPath,
+        receipt_path: receiptPath,
+        page_url: urlOf() ?? '',
+        receipt: result.receipt,
+      }
+    },
+    timeoutMs: 120_000,
+  })
+
+  const openTool = defineTool({
+    name: 'viz_open',
+    description: '打开插件托管的泳道图页面（页面自己连桥，不需要拼 ?bridge=端口）。可传 segs.json 载入数据，缺省用最近一次 viz_ingest 的结果。',
+    parameters: {
+      path: { type: 'string', description: 'segs.json 绝对路径（可选）' },
+      title: { type: 'string', description: '页面标题' },
+      note: { type: 'string', description: '页面说明段落' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          url: { type: 'string', required: true },
+          segs: { type: 'number', required: true },
+          ready: { type: 'boolean', required: true },
+        },
+      },
+      render: textRender((v) => (v.ready ? `页面已就绪（${v.segs} 段）：${v.url}` : `页面已托管但还没有数据：${v.url}`)),
+    },
+    execute: async (args, exec) => {
+      exec.signal.throwIfAborted()
+      if (args.path !== undefined) {
+        const raw = await readFile(String(args.path), 'utf8')
+        const segs = JSON.parse(raw)
+        if (!Array.isArray(segs)) throw new Error('segs.json 必须是数组')
+        page.setData(segs, { title: args.title, note: args.note })
+      }
+      const url = urlOf()
+      if (url === null) throw new Error('当前 profile 没有 webServer，页面托管不可用；用 viz_load 把数据推给已有页面。')
+      return { url, segs: page.segs?.length ?? 0, ready: page.segs !== null }
+    },
+  })
+
+  return { status, stats, at, rounds, view, highlight, load, ingest: ingestTool, open: openTool }
 }
 
 /* ------------------------------------------------------------------ *
@@ -424,12 +593,40 @@ async function readJson(req, limit = 64 * 1024 * 1024) {
 
 export function apply(ctx) {
   const bridge = new Bridge(ctx)
+  const page = new VizPage()
   ctx.effect(() => bridge.start().then((dispose) => {
     try { ctx.logger?.('dsh-viz-timeline')?.info?.(`bridge listening on http://127.0.0.1:${bridge.port}`) } catch { /* best effort */ }
     return dispose
   }), 'viz-timeline: bridge server')
 
-  const tools = vizTools(bridge)
+  // 页面托管：挂在宿主 Web server 上，页面与桥同源，浏览器不用再拼 ?bridge=PORT
+  const webServer = ctx.get('webServer')
+  const webApp = ctx.get('webApp')
+  let origin = null
+  if (webServer !== undefined) {
+    try { origin = webApp?.getAdvertisedUrl?.() ?? webServer.getOrigin() } catch { origin = null }
+  }
+  const urlOf = () => (origin === null ? null : `${String(origin).replace(/\/+$/, '')}${PAGE_PATH}`)
+
+  if (webServer !== undefined) {
+    ctx.effect(() => webServer.register({
+      kind: 'exact',
+      path: PAGE_PATH,
+      handler: async (_req, res) => {
+        const html = await page.html()
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+        res.end(html)
+      },
+    }), 'viz-timeline: hosted page route')
+
+    ctx.effect(() => webServer.register({
+      kind: 'prefix',
+      path: BRIDGE_PATH,
+      handler: (req, res) => bridge.handleRoute(req, res, BRIDGE_PATH),
+    }), 'viz-timeline: same-origin bridge route')
+  }
+
+  const tools = vizTools(bridge, page, urlOf)
   for (const tool of Object.values(tools)) {
     ctx.effect(() => ctx.tools.register(tool), `viz-timeline: tool ${tool.name}`)
   }

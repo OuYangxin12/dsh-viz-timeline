@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Camodel timeline bridge",
+    "description": "Lets a session query and drive camodel-viz timeline pages over a local bridge: statistics, cycle queries, view control, highlight bands, and runtime dataset swap."
+  }
+}

@@ -1,40 +1,48 @@
 # DSH 插件：dsh-viz-timeline
 
-让 DSH 会话获得 7 个原生泳道图工具（`viz_*`），桥跑在 DSH Host 进程内，协议与
-`scripts/bridge_server.py` 完全一致——同一份 `templates/timeline.html` 无需任何改动。
+给 DSH 会话一条从「case 目录」到「能看的泳道图」的通路：`viz_ingest` 解析不规范的仿真 dump，
+`viz_open` 打开插件自己托管的页面，页面与桥同源、不用再拼 `?bridge=端口`；
+`viz_*` 工具让 agent 查统计、定位 cycle、控视图、画高亮。
 
 ## 安装
 
-与 dsh-excalidraw-bridge 相同的方式：
+1. 把 `plugin/` 目录装成 DSH bundle（`plugin_manager install_bundle`，target 传目录绝对路径）。
+2. 装完 `application: applied` 即可用，不需要重启会话。
+3. 页面地址：`<宿主 Web 源>/viz-timeline`（工具回执里的 `page_url` 就是它）。
 
-1. 把整个 `plugin/` 目录安装为 DSH bundle（设置 → 插件，或按 DSH 的 bundle 安装流程）；
-2. 启用后 DSH Host 内监听 `127.0.0.1:47131`（占用则 +1 顺试 20 个）；
-3. 用 `?bridge=端口` 打开泳道图页面（file:// 或静态服务均可），页面右上角出现
-   「bridge：已连接」状态文本；
-4. 会话工具列表出现 `viz_status / viz_stats / viz_at / viz_rounds / viz_view /
-   viz_highlight / viz_load`。
-
-环境变量：`DSH_VIZ_BRIDGE_PORT`（起始端口）、`DSH_VIZ_TOKEN`（可选共享 token，
-页面 URL 加 `&token=...`）。
-
-## 工具一览
+## 工具
 
 | 工具 | 作用 |
 |---|---|
-| `viz_status` | 桥状态：是否有页面连接、队列深度、端口 |
-| `viz_stats` | 段统计：T/轮周期/Δ/行数/执行与排队中位/busy%/等待和 |
-| `viz_at` | 指定 cycle 谁在执行 + 邻近事件 |
-| `viz_rounds` | 逐轮表（push/pop/retire、vec alloc、BMU 地址） |
+| `viz_ingest` | 接 case 目录（可多个 = 多面板 A/B），出 `segs.json` + `receipt.json`，并把数据装进托管页面 |
+| `viz_open` | 打开/刷新托管页面；可传 `segs.json` 直接载入，缺省用最近一次 ingest 的结果 |
+| `viz_status` | 桥状态：有没有页面连着、队列深度、端口 |
+| `viz_stats` | 段统计：T/轮周期/Δ中位/行数/执行与排队中位/busy%/等待和 |
+| `viz_at` | 指定 cycle 谁在执行（`[pop,retire]` 命中）+ 邻近事件 |
+| `viz_rounds` | 逐轮表（load/store 的 push/pop/retire、vec alloc、BMU 地址） |
 | `viz_view` | 视图控制：fit / scale / range / round |
-| `viz_highlight` | 半透明标记带（range 或 round），clear 清除 |
-| `viz_load` | 运行时替换数据（读 parse_dumps.py 的 segs.json 绝对路径） |
+| `viz_highlight` | 半透明标记带（range 或 round），可清除 |
+| `viz_load` | 把一份已有的 `segs.json` 推给页面重渲染 |
+
+## 数据接入的硬约束（回执里逐条有数）
+
+- **未知行型不中断**：进 `receipt.unknown`（模式 + 条数），不 `SystemExit`；没有语义归类的事件名进 `receipt.other_event_names`。
+- **同内容异名文件按 md5 去重**：只解析一次，`receipt.dedupe` 记录谁和谁重复。
+- **debug 回声跳过并计数**：`push_instr_to_prefetch_que` / `pop_prefetch_payload` 计入 `receipt.lines.skipped_debug_echo`。
+- **段界靠 `done+++` trailer**：某段没有 trailer 时回执给 warning，start/tick 用事件区间代替。
+- **截断不出半张图**：驱动日志最后一个 `TASK_BEGIN` 没有 `TASK_DONE` 时返回 `status: blocked`，`reason` 写明文件和行号，不生成任何数据。
+- **时间单位只声明不换算**：`receipt.units` 写明是仿真 cycle（dump-global counter），执行 = retire − pop，排队 = pop − push；不换算 wall 时间、不外推硬件。
+- **空泳道不出**：解析出段但所有段都没有 load/store 事件时返回 `blocked`。
+
+## 目录约定
+
+- 输入：case/evidence 目录（含 `*mte2_issque.dump` / `*mte3_issque.dump` / `*vec_issque.dump` / `*bmu.dump` / 驱动日志）。
+- 输出：`viz_ingest` 的 `out`（缺省 `$DSH_HOME/viz-timeline/<时间戳>/`）下的 `segs.json`、`receipt.json`。
+- 模板：优先用包内 `templates/timeline.html`；本地 link 安装时回落到仓库根目录的 `templates/timeline.html`。
 
 ## 排障
 
-- 工具报「没有可视化页面连接到桥」→ 页面没带 `?bridge=` 或没刷新；先看 `viz_status`。
-- 端口冲突 → 设 `DSH_VIZ_BRIDGE_PORT` 并同步页面 URL。
-- 页面缓存旧版本 → URL 加缓存戳 `?v=N&bridge=PORT`。
-
-## 调试
-
-`node plugin/index.js` 以独立模式直接起桥（不带 DSH 也能用页面 + viz_client.py 联调）。
+- 工具报「没有页面连接到桥」→ 先把 `/viz-timeline` 页面打开（`viz_open` 会回地址），再看 `viz_status`。
+- `/viz-timeline` 打不开 → 该 profile 没有 `webServer` 服务；此时只能用 `viz_load` 推数据给已有页面，`viz_open` 会直接报错说明。
+- 页面显示的是旧数据 → 重新 `viz_ingest` 或 `viz_open`，页面是服务端拼的，刷新即时生效。
+- 端口冲突（loopback 兼容桥）→ 设 `DSH_VIZ_BRIDGE_PORT`；同源页面路由不受影响。

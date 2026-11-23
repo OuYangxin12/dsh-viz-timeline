@@ -155,7 +155,7 @@ function renderWorld(p){
   if(sg.alloc.length||sg.free.length){
     for(let r=0;r<sg.alloc.length;r++){
       const xa=xw(sg,sg.alloc[r]), xf=xw(sg,sg.free[r]), yU=L.BMU_Y+4, yL=L.BMU_Y+16, d=4.5;
-      h.push('<path d="M '+xa+' '+(yU-d)+' L '+(xa+d)+' '+yU+' L '+xa+' '+(yU+d)+' L '+(xa-d)+' '+yU+' Z" fill="#444" data-tip="BMU alloc_addr（r'+r+'）@ '+sg.alloc[r]+'&#10;UB addr '+hex(sg.alloc_addr[r])+'&#10;来源：bmu.dump"/>');
+      h.push('<path d="M '+xa+' '+(yU-d)+' L '+(xa+d)+' '+yU+' L '+xa+' '+(yU+d)+' L '+(xa-d)+' '+yU+' Z" fill="#444" data-tip="BMU alloc_addr（r'+r+'）@ '+sg.alloc[r]+'&#10;UB addr '+(sg.alloc_addr[r]!=null?hex(sg.alloc_addr[r]):'未记录')+'&#10;来源：bmu.dump"/>');
       if(r<sg.free.length) h.push('<path d="M '+xf+' '+(yL-d)+' L '+(xf+d)+' '+yL+' L '+xf+' '+(yL+d)+' L '+(xf-d)+' '+yL+' Z" fill="#fff" stroke="#444" stroke-width="1.2" data-tip="BMU BUF_FREE（r'+r+'）@ '+sg.free[r]+'&#10;来源：mte3_issque 的 BUF_FREE"/>');
     }
   } else {
@@ -217,7 +217,7 @@ function boot(){
     const ds=[]; for(let r=0;r+1<sg.stores.length;r++) ds.push(sg.loads[r+1][0][1]-sg.stores[r][1]);
     sg.dmed=ds.length?Math.round(median(ds)):0;
     sg.period=sg.stores.length>1?Math.round(median(Array.from({length:sg.stores.length-1},(_,r)=>sg.stores[r+1][1]-sg.stores[r][1]))):0;
-    sg.T=sg.tick-sg.start; sg.bars=sg.bars||[];
+    sg.T=sg.tick-sg.start; sg.bars=sg.bars||[]; sg.alloc_addr=sg.alloc_addr||[];
     const m2=assignRows([].concat.apply([], sg.loads.map(rd=>rd.map(L=>[L[1],L[2]]))));
     sg.m2row=m2.row; sg.m2n=m2.n;
     const m3=assignRows(sg.stores.map(st=>[st[1],st[2]]));
@@ -242,7 +242,8 @@ function boot(){
     const M2_Y=22, M2_H=sg.m2n*PITCH+2, VEC_Y=M2_Y+M2_H+2, M3_Y=VEC_Y+24;
     const M3_H=sg.m3n*PITCH3+2, BMU_Y=M3_Y+M3_H+4, EVT_Y=BMU_Y+24, WH=EVT_Y+26;
     const lyc=(t,h)=>t+Math.max(2,(h-24)/2);
-    const addrTxt=sg.alloc_addr.length?(hex(sg.alloc_addr[0])+'→'+hex(sg.alloc_addr[sg.alloc_addr.length-1])):'无';
+    const addrs=(sg.alloc_addr||[]).filter(a=>a!=null);
+    const addrTxt=addrs.length?(hex(addrs[0])+'→'+hex(addrs[addrs.length-1])):'未记录';
     const LBL=[{t:'轮次 r0–r'+(sg.loads.length-1),y:13},
       {t:'MTE2 load',y:lyc(M2_Y,M2_H),sub:'×'+sg.loads[0].length+'/轮 · 重叠分行 r'+sg.m2n},
       {t:'VEC pipe',y:lyc(VEC_Y,24),sub:sg.vecp.length?('vec_issque：BUF_ALLOC×'+sg.vecp.length):'vec_issque：无事件'},
@@ -329,13 +330,19 @@ window.__bridgeRedraw=function(p){
   p.world.appendChild(t);
 };
 (function(){
+  const rel=window.__VIZ_BRIDGE_BASE__||null;
   const m=/[?#&]bridge(?:=(\d+))?/.exec(location.search+' '+location.hash);
-  if(!m) return;
-  const port=m[1]||'47131';
+  if(!m&&!rel) return;
+  const port=(m&&m[1])||'47131';
   const tok=(/[?&]token=([^&]+)/.exec(location.search)||[])[1]||'';
-  const B='http://127.0.0.1:'+port;
+  const B=rel||('http://127.0.0.1:'+port);
+  const WHERE=rel?('同源 '+location.origin+rel):('127.0.0.1:'+port);
   const stEl=document.getElementById('bridgestate');
   let since=0;
+  /* 页面自检：JS 报错与启动状态回传给桥，agent 用 /events 就能看到页面坏在哪 */
+  const report=(o)=>{ try{ post('/event',Object.assign({type:'page'},o)).catch(()=>{}); }catch(e){} };
+  window.addEventListener('error',(e)=>report({kind:'error',message:String(e.message),line:e.lineno||null,src:e.filename||null}));
+  setTimeout(()=>report({kind:'boot',segs:(typeof SEGS!=='undefined'?SEGS.length:-1),panels:panels.length}),0);
   async function post(path,obj){
     const r=await fetch(B+path,{method:'POST',headers:{'Content-Type':'application/json','X-Viz-Token':tok},body:JSON.stringify(obj)});
     return r.json();
@@ -418,15 +425,15 @@ window.__bridgeRedraw=function(p){
         const j=await r.json();
         if(j.cmd){
           since=(typeof j.since==='number')?j.since:j.cmd.seq;
-          if(stEl) stEl.textContent='［bridge：已连接 127.0.0.1:'+port+'，处理 #'+j.cmd.body.op+'（since='+since+'）］';
+          if(stEl) stEl.textContent='［bridge：已连接 '+WHERE+'，处理 #'+j.cmd.body.op+'（since='+since+'）］';
           let out;
           try{ out=run(j.cmd.body); if(out&&out.then) out=await out; reply(j.cmd.body._id||j.cmd.seq,true,out); }
           catch(err){ reply(j.cmd.body._id||j.cmd.seq,false,{error:String(err)}); }
-        } else { since=(typeof j.since==='number')?j.since:0; if(stEl) stEl.textContent='［bridge：已连接 127.0.0.1:'+port+'，since='+since+'，等待命令…］'; }
-      }catch(e){ if(stEl) stEl.textContent='［bridge：等待 127.0.0.1:'+port+'…］'; await new Promise(r2=>setTimeout(r2,2000)); }
+        } else { since=(typeof j.since==='number')?j.since:0; if(stEl) stEl.textContent='［bridge：已连接 '+WHERE+'，since='+since+'，等待命令…］'; }
+      }catch(e){ if(stEl) stEl.textContent='［bridge：等待 '+WHERE+'…］'; await new Promise(r2=>setTimeout(r2,2000)); }
     }
   }
-  if(stEl) stEl.textContent='［bridge：连接 127.0.0.1:'+port+'…］';
+  if(stEl) stEl.textContent='［bridge：连接 '+WHERE+'…］';
   poll();
 })();
 
