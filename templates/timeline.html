@@ -43,10 +43,13 @@
   .tip .pin{color:#ffd27f}
   .hint{color:#999;font-size:11px;margin:2px 0 0 140px}
   .caveat{color:var(--sub);font-size:12px;margin-top:14px;border-top:1px solid var(--line);padding-top:8px}
+  .badge{background:#fff4e5;border:1px solid #e08214;color:#8a4b00;border-radius:6px;padding:7px 11px;margin:8px 0 4px;font-size:12.5px;max-width:1100px}
+  .badge b{color:#a03000}
 </style>
 </head>
 <body>
 <h1>__H1__</h1>
+<div class="badge" id="badge">__BADGE__</div>
 <p class="desc">原则：<b>日志里有什么就画什么</b>——每条图形可溯源到具体 dump（悬停可见来源）。执行条（load/store）按 [pop,retire] 重叠自动分行，所有 pipe 条互不重叠。每个面板独立缩放与平移（各自滑块/滚轮/按钮，互不同步）；悬停看数值；点击固定。条上文字随缩放按碰撞避让自适应显隐。<span id="bridgestate"></span></p>
 <p class="desc" id="note">__NOTE__</p>
 

@@ -31,6 +31,8 @@ const PORT_ATTEMPTS = 20
 const LONG_POLL_MS = 25_000
 const PAGE_STALE_MS = 45_000
 const PAGE_PATH = '/viz-timeline'
+const STATE_DIR = join(process.env.DSH_HOME ?? homedir(), 'viz-timeline')
+const STATE_PATH = join(STATE_DIR, 'page-state.json')
 const BRIDGE_PATH = '/viz-timeline/bridge'
 
 
@@ -206,51 +208,84 @@ class Bridge {
 
 class VizPage {
   constructor() {
-    this.segs = null
-    this.meta = { title: 'camodel 泳道图', h1: null, note: '' }
-    this.template = null
+    this.data = null
+    this.view = 'timeline'
+    this.meta = { title: 'camodel 泳道图', h1: null, note: '', badge: '' }
+    this.templates = new Map()
     this.updatedAt = 0
     this.receipt = null
+    this.hydrated = false
   }
 
-  async templateText() {
-    if (this.template !== null) return this.template
+  /** 宿主重启后页面不该退回空态：上次的数据与页头状态从磁盘恢复一次。 */
+  async hydrate() {
+    if (this.hydrated) return
+    this.hydrated = true
+    try {
+      const st = JSON.parse(await readFile(STATE_PATH, 'utf8'))
+      if (st !== null && st.data !== undefined && st.data !== null) {
+        this.data = st.data
+        this.view = st.view === 'blocks' ? 'blocks' : 'timeline'
+        this.meta = { ...this.meta, ...(st.meta ?? {}) }
+        this.updatedAt = Number(st.updatedAt ?? 0) || 0
+      }
+    } catch { /* 没有历史状态就保持空态 */ }
+  }
+
+  async persist() {
+    try {
+      await mkdir(STATE_DIR, { recursive: true })
+      await writeFile(STATE_PATH, JSON.stringify({ view: this.view, meta: this.meta, data: this.data, updatedAt: this.updatedAt }))
+    } catch { /* 落盘失败不影响页面 */ }
+  }
+
+  async templateText(file) {
+    const cached = this.templates.get(file)
+    if (cached !== undefined) return cached
     for (const url of [
-      new URL('./templates/timeline.html', import.meta.url),
-      new URL('../templates/timeline.html', import.meta.url),
+      new URL(`./templates/${file}`, import.meta.url),
+      new URL(`../templates/${file}`, import.meta.url),
     ]) {
       try {
-        this.template = await readFile(url, 'utf8')
-        return this.template
+        const text = await readFile(url, 'utf8')
+        this.templates.set(file, text)
+        return text
       } catch { /* 试下一个位置 */ }
     }
-    throw new Error('找不到 timeline.html 模板：插件目录 templates/ 与仓库 templates/ 都没有。')
+    throw new Error(`找不到 ${file} 模板：插件目录 templates/ 与仓库 templates/ 都没有。`)
   }
 
-  setData(segs, meta = {}, receipt = null) {
-    this.segs = segs
+  setData(data, meta = {}, receipt = null) {
+    this.data = data
+    this.view = meta.view ?? (Array.isArray(data) ? 'timeline' : 'blocks')
     this.meta = { ...this.meta, ...meta }
     this.receipt = receipt
     this.updatedAt = Date.now()
+    this.hydrated = true
+    void this.persist()
   }
 
   async html() {
-    if (this.segs === null) {
+    await this.hydrate()
+    if (this.data === null) {
       return `<!doctype html><meta charset="utf-8"><title>camodel 泳道图</title>
 <style>body{font:14px/1.6 system-ui;margin:40px;color:#333}code{background:#f3f3f3;padding:1px 5px;border-radius:3px}</style>
 <p>还没有数据。让会话跑一次 <code>viz_ingest</code>，页面会自动刷新。</p>
 <script>setTimeout(()=>location.reload(),3000)</script>`
     }
-    const tpl = await this.templateText()
-    const title = this.meta.title ?? 'camodel 泳道图'
-    const replaced = tpl.replace('const SEGS = __SEGS__;', () =>
-      `window.__VIZ_BRIDGE_BASE__=${JSON.stringify(BRIDGE_PATH)};\nconst SEGS = ${JSON.stringify(this.segs)};`)
+    const isBlocks = this.view === 'blocks'
+    const tpl = await this.templateText(isBlocks ? 'blocks.html' : 'timeline.html')
+    const title = this.meta.title ?? (isBlocks ? 'camodel 块调度' : 'camodel 泳道图')
+    const payloadKey = isBlocks ? 'DATA' : 'SEGS'
+    const replaced = tpl.replace(`const ${payloadKey} = __SEGS__;`, () =>
+      `window.__VIZ_BRIDGE_BASE__=${JSON.stringify(BRIDGE_PATH)};\nconst ${payloadKey} = ${JSON.stringify(this.data)};`)
     let html = replaced
       .replace(/__TITLE__/g, () => title)
       .replace(/__H1__/g, () => this.meta.h1 ?? title)
-    html = this.meta.note
-      ? html.replace(/__NOTE__/g, () => this.meta.note)
-      : html.replace(/<p class="desc" id="note">__NOTE__<\/p>\n?/, '')
+    html = html.replace(/__NOTE__/g, () => this.meta.note ?? '')
+    html = this.meta.badge
+      ? html.replace(/__BADGE__/g, () => this.meta.badge)
+      : html.replace(/<div class="badge" id="badge">__BADGE__<\/div>\n?/, '')
     return html
   }
 }
@@ -459,28 +494,35 @@ function vizTools(bridge, page, urlOf) {
     execute: async (args, exec) => {
       exec.signal.throwIfAborted()
       const raw = await readFile(String(args.path), 'utf8')
-      const segs = JSON.parse(raw)
-      if (!Array.isArray(segs)) throw new Error('segs.json 必须是数组')
-      return run({ op: 'load', segs }, exec, 30_000)
+      const data = JSON.parse(raw)
+      if (Array.isArray(data)) return run({ op: 'load', segs: data }, exec, 30_000)
+      if (data !== null && Array.isArray(data.blocks) && Array.isArray(data.tasks)) {
+        page.setData(data, { view: 'blocks', title: args.title })
+        return { loaded: data.blocks.length, view: 'blocks', note: '块调度数据已装进托管页面，刷新页面可见。' }
+      }
+      throw new Error('数据文件既不是 SEGS 数组，也不是 {blocks,tasks} 的块调度数据')
     },
     timeoutMs: 30_000,
   })
 
   const ingestTool = defineTool({
     name: 'viz_ingest',
-    description: '接 case 目录出泳道图数据：读目录里的 issue-queue dump 与驱动日志，按 done+++ 分段识别事件，产出 segs.json 和对账回执（识别/未识别行数、md5 去重、跳过的 debug 回声、段界、截断告警、时间单位口径）。未知行型进回执不中断；日志截断时返回 blocked 不生成图。',
+    description: '接 case 目录出图：读 issue-queue dump 与驱动日志，产出页面数据和对账回执（识别/未识别行数、md5 去重、跳过的 debug 回声、段界、截断告警、时间单位口径）。dump 走 done+++ 分段出泳道图；driver 日志按 stream 出块调度图，完整 stream 照常渲染、缺 TASK_DONE 的 stream 标 incomplete 进回执不渲染。未知行型进回执不中断。',
     parameters: {
       dirs: { type: 'array', items: { type: 'string' }, required: true, description: 'case 目录绝对路径，可传多个（多目录 = 多面板 A/B 对照）' },
       title: { type: 'string', description: '页面标题' },
       note: { type: 'string', description: '页面说明段落（口径、样例来源等）' },
-      out: { type: 'string', description: 'segs.json 与 receipt.json 的输出目录（缺省为系统临时目录）' },
+      out: { type: 'string', description: '页面数据（segs.json / blocks.json）与 receipt.json 的输出目录（缺省为 $DSH_HOME/viz-timeline/<时间戳>/）' },
     },
     output: {
       schema: {
         type: 'object', additionalProperties: true,
         properties: {
           status: { type: 'string', required: true },
-          segs: { type: 'number' },
+          view: { type: 'string', description: 'timeline = 指令级泳道图；blocks = 驱动级块调度图' },
+          segs: { type: 'number', description: 'timeline 视图的段数' },
+          blocks: { type: 'number', description: 'blocks 视图的 block 数' },
+          incomplete_streams: { type: 'number', description: 'driver 日志里没跑完、未渲染的 stream 数' },
           segs_path: { type: 'string' },
           receipt_path: { type: 'string' },
           page_url: { type: 'string' },
@@ -488,6 +530,12 @@ function vizTools(bridge, page, urlOf) {
       },
       render: textRender((v) => {
         if (v.status !== 'ok') return `没出图：${v.reason ?? '未知原因'}`
+        if (v.view === 'blocks') {
+          const lines = (v.receipt?.streams ?? []).map((s) => (s.incomplete
+            ? `stream ${s.stream}：未跑完，未渲染（${s.incomplete_reasons.join('；')}）`
+            : `stream ${s.stream}：${s.block_finished} block，${s.begin} → ${s.done}（${s.T} cycle，${s.cores} core）`)).join('\n')
+          return `已出块调度图：${v.blocks} 个 block，${(v.receipt?.streams ?? []).filter((s) => !s.incomplete).length} 个完整 stream，${v.incomplete_streams ?? 0} 个未跑完未渲染。\n${lines}\n页面：${v.page_url ?? '(未托管)'}\n数据: ${v.segs_path}\n回执: ${v.receipt_path}`
+        }
         const l = v.receipt?.lines ?? {}
         const segs = (v.receipt?.segments ?? []).map((s) => `seg${s.i} ${s.kind} T=${s.T} load ${s.counts.load}/store ${s.counts.store}/alloc ${s.counts.alloc}/free ${s.counts.free}/bar ${s.counts.bar}`).join('\n')
         return `已出 ${v.segs} 段。识别 ${l.events_recognized ?? '?'} 行事件，未识别 ${l.unrecognized ?? '?'} 行，跳过 debug 回声 ${l.skipped_debug_echo ?? '?'} 行。\n${segs}\n页面：${v.page_url ?? '(未托管)'}\nsegs: ${v.segs_path}\n回执: ${v.receipt_path}`
@@ -504,23 +552,37 @@ function vizTools(bridge, page, urlOf) {
       await mkdir(outDir, { recursive: true })
       const receiptPath = join(outDir, 'receipt.json')
       await writeFile(receiptPath, JSON.stringify(result.receipt ?? {}, null, 2))
-      if (result.status !== 'ok' || !Array.isArray(result.segs)) {
+      const data = result.view === 'blocks' ? result.blocks : result.segs
+      const ready = result.status === 'ok' && data !== null && data !== undefined
+      if (!ready) {
         return {
           status: result.status ?? 'blocked',
+          view: result.view ?? null,
           reason: result.reason ?? result.detail ?? '没有可出图的数据',
           detail: result.detail ?? null,
           receipt: result.receipt ?? null,
-          segs: 0, segs_path: '', receipt_path: receiptPath, page_url: '',
+          segs: 0, blocks: 0, incomplete_streams: 0,
+          segs_path: '', receipt_path: receiptPath, page_url: '',
         }
       }
-      const segsPath = join(outDir, 'segs.json')
-      await writeFile(segsPath, JSON.stringify(result.segs))
-      const title = args.title ?? `camodel 泳道图（${dirs.map((d) => basename(d)).join(' / ')}）`
-      page.setData(result.segs, { title, h1: title, note: args.note ?? '' }, result.receipt)
+      const dataPath = join(outDir, result.view === 'blocks' ? 'blocks.json' : 'segs.json')
+      await writeFile(dataPath, JSON.stringify(data))
+      const title = args.title ?? (result.view === 'blocks'
+        ? `camodel 块调度（${dirs.map((d) => basename(d)).join(' / ')}）`
+        : `camodel 泳道图（${dirs.map((d) => basename(d)).join(' / ')}）`)
+      const incomplete = (result.receipt?.streams ?? []).filter((s) => s.incomplete)
+      const badge = incomplete.length === 0 ? '' : incomplete.map((s) => {
+        const exit = (result.receipt?.driver ?? []).find((d) => d.file === s.file)?.exit_code
+        return `<b>⚠ stream ${s.stream} 未跑完，这个 stream 没有画</b>：${s.incomplete_reasons.join('；')}${exit === null || exit === undefined ? '' : `（EXIT=${exit}）`}。`
+      }).join(' ') + (result.view === 'blocks' ? ' 页面里只有完整 stream 的 block。' : '')
+      page.setData(data, { view: result.view, title, h1: title, note: args.note ?? '', badge }, result.receipt)
       return {
         status: 'ok',
-        segs: result.segs.length,
-        segs_path: segsPath,
+        view: result.view ?? 'timeline',
+        segs: Array.isArray(data) ? data.length : 0,
+        blocks: result.view === 'blocks' ? data.blocks.length : 0,
+        incomplete_streams: incomplete.length,
+        segs_path: dataPath,
         receipt_path: receiptPath,
         page_url: urlOf() ?? '',
         receipt: result.receipt,
@@ -531,35 +593,48 @@ function vizTools(bridge, page, urlOf) {
 
   const openTool = defineTool({
     name: 'viz_open',
-    description: '打开插件托管的泳道图页面（页面自己连桥，不需要拼 ?bridge=端口）。可传 segs.json 载入数据，缺省用最近一次 viz_ingest 的结果。',
+    description: '打开插件托管的可视化页面（页面自己连桥，不需要拼 ?bridge=端口）。可传 segs.json（泳道图）或 blocks.json（块调度图）载入数据，缺省用最近一次 viz_ingest 的结果。',
     parameters: {
-      path: { type: 'string', description: 'segs.json 绝对路径（可选）' },
+      path: { type: 'string', description: 'segs.json / blocks.json 绝对路径（可选）' },
       title: { type: 'string', description: '页面标题' },
       note: { type: 'string', description: '页面说明段落' },
     },
     output: {
       schema: {
-        type: 'object', additionalProperties: false,
+        type: 'object', additionalProperties: true,
         properties: {
           url: { type: 'string', required: true },
+          view: { type: 'string', required: true },
           segs: { type: 'number', required: true },
+          blocks: { type: 'number', required: true },
           ready: { type: 'boolean', required: true },
         },
       },
-      render: textRender((v) => (v.ready ? `页面已就绪（${v.segs} 段）：${v.url}` : `页面已托管但还没有数据：${v.url}`)),
+      render: textRender((v) => {
+        if (!v.ready) return `页面已托管但还没有数据：${v.url}`
+        return v.view === 'blocks' ? `页面已就绪（块调度图，${v.blocks} 个 block）：${v.url}` : `页面已就绪（泳道图，${v.segs} 段）：${v.url}`
+      }),
     },
     execute: async (args, exec) => {
       exec.signal.throwIfAborted()
       if (args.path !== undefined) {
         const raw = await readFile(String(args.path), 'utf8')
-        const segs = JSON.parse(raw)
-        if (!Array.isArray(segs)) throw new Error('segs.json 必须是数组')
-        page.setData(segs, { title: args.title, note: args.note })
+        const data = JSON.parse(raw)
+        if (Array.isArray(data)) page.setData(data, { view: 'timeline', title: args.title, note: args.note })
+        else if (data !== null && Array.isArray(data.blocks) && Array.isArray(data.tasks)) page.setData(data, { view: 'blocks', title: args.title, note: args.note })
+        else throw new Error('数据文件既不是 SEGS 数组，也不是 {blocks,tasks} 的块调度数据')
       }
       const url = urlOf()
       if (url === null) throw new Error('当前 profile 没有 webServer，页面托管不可用；用 viz_load 把数据推给已有页面。')
-      return { url, segs: page.segs?.length ?? 0, ready: page.segs !== null }
+      return {
+        url,
+        view: page.view,
+        segs: Array.isArray(page.data) ? page.data.length : 0,
+        blocks: page.view === 'blocks' ? (page.data?.blocks?.length ?? 0) : 0,
+        ready: page.data !== null,
+      }
     },
+
   })
 
   return { status, stats, at, rounds, view, highlight, load, ingest: ingestTool, open: openTool }

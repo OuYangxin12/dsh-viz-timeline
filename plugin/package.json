@@ -1,9 +1,9 @@
 {
   "name": "dsh-viz-timeline",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
-  "description": "Turn camodel simulation artifacts into a hosted swim-lane chart: ingest a case directory into SEGS data with a reconciliation receipt, serve the page under the host web server, and let the agent query and drive it over a same-origin bridge.",
+  "description": "Turn camodel simulation artifacts into a hosted chart: ingest a case directory into swim-lane (instruction-level) or block-schedule (driver-level) data with a reconciliation receipt, serve the page under the host web server, and let the agent query and drive it over a same-origin bridge.",
   "exports": {
     ".": "./index.js",
     "./ingest": "./ingest.js",
@@ -19,7 +19,9 @@
     "README.md"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "manifestVersion": 1
   }
 }

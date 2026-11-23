@@ -14,8 +14,8 @@
 
 | 工具 | 作用 |
 |---|---|
-| `viz_ingest` | 接 case 目录（可多个 = 多面板 A/B），出 `segs.json` + `receipt.json`，并把数据装进托管页面 |
-| `viz_open` | 打开/刷新托管页面；可传 `segs.json` 直接载入，缺省用最近一次 ingest 的结果 |
+| `viz_ingest` | 接 case 目录（可多个 = 多面板 A/B），出 `segs.json`/`blocks.json` + `receipt.json`，并把数据装进托管页面 |
+| `viz_open` | 打开/刷新托管页面；可传 `segs.json` 或 `blocks.json` 直接载入，缺省用最近一次 ingest 的结果 |
 | `viz_status` | 桥状态：有没有页面连着、队列深度、端口 |
 | `viz_stats` | 段统计：T/轮周期/Δ中位/行数/执行与排队中位/busy%/等待和 |
 | `viz_at` | 指定 cycle 谁在执行（`[pop,retire]` 命中）+ 邻近事件 |
@@ -30,14 +30,23 @@
 - **同内容异名文件按 md5 去重**：只解析一次，`receipt.dedupe` 记录谁和谁重复。
 - **debug 回声跳过并计数**：`push_instr_to_prefetch_que` / `pop_prefetch_payload` 计入 `receipt.lines.skipped_debug_echo`。
 - **段界靠 `done+++` trailer**：某段没有 trailer 时回执给 warning，start/tick 用事件区间代替。
-- **截断不出半张图**：驱动日志最后一个 `TASK_BEGIN` 没有 `TASK_DONE` 时返回 `status: blocked`，`reason` 写明文件和行号，不生成任何数据。
-- **时间单位只声明不换算**：`receipt.units` 写明是仿真 cycle（dump-global counter），执行 = retire − pop，排队 = pop − push；不换算 wall 时间、不外推硬件。
+- **截断不出半张图，但完整段照常出**：驱动日志按 stream 判完整性。缺 `TASK_DONE`、block 事件少于 grid 声明、有 block 没 `block_end` 的 stream 标 `incomplete: true` 进回执并在页头打标，不渲染；其它完整 stream 照常出图。所有 stream 都不完整时才返回 `blocked`。
+- **时间单位只声明不换算**：`receipt.units` 写明是仿真 cycle（dump-global counter），执行 = retire − pop，排队 = pop − push；不换算 wall 时间、不外推硬件。driver 日志同理：block 执行 = [block_start, block_end]，drain = [early_end, block_end]，task 时长 = TASK_DONE − TASK_BEGIN（只对完整 stream 成立）。
 - **空泳道不出**：解析出段但所有段都没有 load/store 事件时返回 `blocked`。
+
+## 两种视图
+
+| 输入 | 视图 | 数据 | 粒度 |
+|---|---|---|---|
+| `*_issque.dump` / `*bmu.dump` | 泳道图 `timeline.html` | `segs.json`（SEGS 数组） | 指令级 Push/RETIRE 事件 |
+| 驱动 ESL 日志（`TASK_BEGIN` / `block_start`） | 块调度图 `blocks.html` | `blocks.json`（`{blocks, tasks, streams}`） | 每 core 一根 block 条 |
+
+两类文件同时存在时优先出泳道图，driver 的完整性结论仍写进回执。两种粒度不可直接互比。
 
 ## 目录约定
 
 - 输入：case/evidence 目录（含 `*mte2_issque.dump` / `*mte3_issque.dump` / `*vec_issque.dump` / `*bmu.dump` / 驱动日志）。
-- 输出：`viz_ingest` 的 `out`（缺省 `$DSH_HOME/viz-timeline/<时间戳>/`）下的 `segs.json`、`receipt.json`。
+- 输出：`viz_ingest` 的 `out`（缺省 `$DSH_HOME/viz-timeline/<时间戳>/`）下的 `segs.json`（或 `blocks.json`）、`receipt.json`。
 - 模板：优先用包内 `templates/timeline.html`；本地 link 安装时回落到仓库根目录的 `templates/timeline.html`。
 
 ## 排障

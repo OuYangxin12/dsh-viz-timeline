@@ -32,12 +32,15 @@
   .tip .pin{color:#ffd27f}
   .hint{color:#999;font-size:11px;margin:2px 0 0 64px}
   .caveat{color:var(--sub);font-size:12px;margin-top:14px;border-top:1px solid var(--line);padding-top:8px}
+  .badge{background:#fff4e5;border:1px solid #e08214;color:#8a4b00;border-radius:6px;padding:7px 11px;margin:8px 0 4px;font-size:12.5px;max-width:1100px}
+  .badge b{color:#a03000}
 </style>
 </head>
 <body>
 <h1>__H1__</h1>
+<div class="badge" id="badge">__BADGE__</div>
 <p class="desc">驱动级日志（TASK_BEGIN/DONE、block_start / early_end / block_end）。绿条 = block 执行区间，深绿段 = drain，竖线 = task 边界。交互：滚轮以光标为锚缩放、底部滚动条/小地图平移、悬停看数值、点击固定。</p>
-<p class="desc" id="note">__NOTE__</p>
+<p class="desc" id="note">__NOTE__ <span id="bridgestate"></span></p>
 
 <div class="controls">
   <span class="legend">
@@ -71,11 +74,13 @@ const C1=Math.max(...DATA.blocks.map(b=>b.end),...DATA.tasks.map(t=>t.cycle))+40
 const laneOf={}; cores.forEach((c,i)=>laneOf[c]=i);
 const WH=cores.length*PITCH+8;
 const durs=DATA.blocks.map(b=>b.end-b.start), drains=DATA.blocks.map(b=>b.end-b.early);
-const task0=DATA.tasks.find(t=>t.kind==='TASK_BEGIN'&&t.stream===0), task0done=DATA.tasks.find(t=>t.kind==='TASK_DONE'&&t.stream===0);
+const firstBegin=DATA.tasks.find(t=>t.kind==='TASK_BEGIN');
+const firstDone=firstBegin?DATA.tasks.find(t=>t.kind==='TASK_DONE'&&t.ftid===firstBegin.ftid):null;
+const firstWall=firstBegin&&firstDone?firstDone.cycle-firstBegin.cycle:null;
 
 (function(){
-  const row='<tr><td class=l>'+DATA.blocks.length+'</td><td>'+cores.length+'</td><td>'+(task0done.cycle-task0.cycle)+'</td><td>'+Math.min(...durs)+' / '+Math.round(median(durs))+' / '+Math.max(...durs)+'</td><td>'+Math.min(...drains)+' / '+Math.round(median(drains))+' / '+Math.max(...drains)+'</td><td class=l>'+DATA.blocks.length+' blocks / '+cores.length+' cores</td></tr>';
-  document.getElementById('summary').innerHTML='<table class=sum><tr><th class=l>blocks</th><th>cores</th><th>task0 wall(cyc)</th><th>dur min/med/max</th><th>drain min/med/max</th><th class=l>备注</th></tr>'+row+'</table>';
+  const row='<tr><td class=l>'+DATA.blocks.length+'</td><td>'+cores.length+'</td><td>'+(firstWall===null?'未记录':firstWall)+'</td><td>'+Math.min(...durs)+' / '+Math.round(median(durs))+' / '+Math.max(...durs)+'</td><td>'+Math.min(...drains)+' / '+Math.round(median(drains))+' / '+Math.max(...drains)+'</td><td class=l>'+DATA.blocks.length+' blocks / '+cores.length+' cores</td></tr>';
+  document.getElementById('summary').innerHTML='<table class=sum><tr><th class=l>blocks</th><th>cores</th><th>首 task wall(cyc)</th><th>dur min/med/max</th><th>drain min/med/max</th><th class=l>备注</th></tr>'+row+'</table>';
 })();
 
 const panelBox=document.getElementById('panel');
@@ -182,6 +187,48 @@ document.addEventListener('click',e=>{ const t=e.target.closest('[data-tip]');
   else { pinned=false; tip.style.display='none'; } });
 window.addEventListener('resize',()=>{ renderAxis(); renderMini(); });
 applyScale(scroller.clientWidth/((C1-C0)*1.02), null, 0);
+
+/* --- 桥客户端：块调度视图只提供渲染，查询类 op 立即回清晰错误 --- */
+(function(){
+  const rel=window.__VIZ_BRIDGE_BASE__||null;
+  const m=/[?#&]bridge(?:=(\d+))?/.exec(location.search+' '+location.hash);
+  if(!m&&!rel) return;
+  const port=(m&&m[1])||'47131';
+  const tok=(/[?&]token=([^&]+)/.exec(location.search)||[])[1]||'';
+  const B=rel||('http://127.0.0.1:'+port);
+  const WHERE=rel?('同源 '+location.origin+rel):('127.0.0.1:'+port);
+  const stEl=document.getElementById('bridgestate');
+  const setState=(ok)=>setTimeout(()=>{ if(stEl) stEl.textContent='bridge：'+(ok?'连接 ':'未连接 ')+WHERE; },0);
+  const report=(o)=>{ try{ post('/event',Object.assign({type:'page'},o)).catch(()=>{}); }catch(e){} };
+  window.addEventListener('error',(e)=>report({kind:'error',message:String(e.message),line:e.lineno||null,src:e.filename||null}));
+  async function post(path,obj){
+    const r=await fetch(B+path,{method:'POST',headers:{'Content-Type':'application/json','X-Viz-Token':tok},body:JSON.stringify(obj)});
+    return r.json();
+  }
+  function reply(id,ok,data){ post('/event',{type:'result',id,ok,data}).catch(()=>{}); }
+  const ONLY='块调度视图（driver 日志）只画 block 甘特图，没有指令级事件。要查统计/轮次/cycle 明细，请把 issue-queue dump 目录出泳道图后用同样的问题再问。';
+  let since=0;
+  (async function loop(){
+    for(;;){
+      try{
+        const r=await fetch(B+'/next?since='+since,{headers:{'X-Viz-Token':tok}});
+        const j=await r.json();
+        since=j.since||since;
+        setState(true);
+        if(!j.cmd) continue;
+        const c=j.cmd, b=c.body||{};
+        if(c.kind!=='cmd') continue;
+        if(b.op==='hello'){ reply(c.seq,true,{view:'blocks',blocks:DATA.blocks.length,streams:(DATA.streams||[]).length}); continue; }
+        reply(c.seq,false,{error:ONLY});
+      }catch(e){
+        setState(false);
+        await new Promise(r=>setTimeout(r,3000));
+      }
+    }
+  })();
+  setTimeout(()=>report({kind:'boot',view:'blocks',blocks:DATA.blocks.length}),0);
+})();
+
 </script>
 </body>
 </html>
