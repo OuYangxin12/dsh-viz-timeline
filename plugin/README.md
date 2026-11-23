@@ -34,6 +34,11 @@
 - **时间单位只声明不换算**：`receipt.units` 写明是仿真 cycle（dump-global counter），执行 = retire − pop，排队 = pop − push；不换算 wall 时间、不外推硬件。driver 日志同理：block 执行 = [block_start, block_end]，drain = [early_end, block_end]，task 时长 = TASK_DONE − TASK_BEGIN（只对完整 stream 成立）。
 - **空泳道不出**：解析出段但所有段都没有 load/store 事件时返回 `blocked`。
 
+## 页面状态会保留
+
+`viz_ingest` / `viz_open` 把数据装进页面时会同时落盘到 `$DSH_HOME/viz-timeline/page-state.json`。
+宿主重启后插件第一次被访问时从这份状态恢复，页面不会退回空态；重新 ingest 会覆盖它。
+
 ## 两种视图
 
 | 输入 | 视图 | 数据 | 粒度 |
